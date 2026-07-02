@@ -13,6 +13,8 @@ $script:ChangedItems = New-Object System.Collections.Generic.List[string]
 $script:VerifiedItems = New-Object System.Collections.Generic.List[string]
 $script:SkippedItems = New-Object System.Collections.Generic.List[string]
 $script:NeedsApprovalItems = New-Object System.Collections.Generic.List[string]
+$Module = @($Module | ForEach-Object { if ($null -ne $_) { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if (-not $Module -or $Module.Count -eq 0) { $Module = @('All') }
 $Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -77,6 +79,144 @@ function Invoke-RepairAction {
 function Test-CommandAvailable {
     param([Parameter(Mandatory)][string]$Name)
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function ConvertTo-SafeVersion {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $match = [regex]::Match($Value, '\d+(\.\d+){1,3}')
+    if (-not $match.Success) { return $null }
+    try { return [version]$match.Value } catch { return $null }
+}
+
+function Get-WingetCommandPath {
+    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) { return $cmd.Source }
+
+    $windowsApps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path -LiteralPath $windowsApps -PathType Leaf) { return $windowsApps }
+
+    $packages = @(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue)
+    if (-not $packages -or $packages.Count -eq 0) {
+        $packages = @(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue)
+    }
+    foreach ($package in $packages) {
+        if (-not [string]::IsNullOrWhiteSpace($package.InstallLocation)) {
+            $candidate = Join-Path $package.InstallLocation 'winget.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        }
+    }
+    return $null
+}
+
+function Repair-WingetAvailability {
+    $wingetPath = Get-WingetCommandPath
+    if ($wingetPath) { return $wingetPath }
+
+    $windowsAppsDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+    if (Test-Path -LiteralPath $windowsAppsDir -PathType Container) {
+        $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+        if ($null -eq $userPath) { $userPath = '' }
+        $pathParts = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($pathParts -notcontains $windowsAppsDir) {
+            if (Invoke-RepairAction -Description "Added WindowsApps app-alias directory to user PATH for winget: $windowsAppsDir" -Action {
+                $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $windowsAppsDir } else { "$userPath;$windowsAppsDir" }
+                [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+                $env:Path = "$env:Path;$windowsAppsDir"
+            }) {
+                $wingetPath = Get-WingetCommandPath
+                if ($wingetPath) { return $wingetPath }
+            }
+        }
+    }
+
+    $appInstaller = @(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($appInstaller -and $appInstaller.InstallLocation) {
+        $manifest = Join-Path $appInstaller.InstallLocation 'AppXManifest.xml'
+        if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+            Invoke-RepairAction -Description 'Re-registered Microsoft App Installer package so winget app alias can resolve.' -Action {
+                Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
+            } | Out-Null
+            $wingetPath = Get-WingetCommandPath
+            if ($wingetPath) { return $wingetPath }
+        }
+    }
+
+    if (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue) {
+        $cacheRoot = Join-Path $Root 'tools\winget-cache'
+        $bundlePath = Join-Path $cacheRoot 'Microsoft.DesktopAppInstaller.msixbundle'
+        Invoke-RepairAction -Description 'Installed Microsoft App Installer from the official winget msixbundle so winget.exe can resolve.' -Action {
+            New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+            Invoke-WebRequest -Uri 'https://aka.ms/getwinget' -OutFile $bundlePath -UseBasicParsing -ErrorAction Stop
+            Add-AppxPackage -Path $bundlePath -ErrorAction Stop
+        } | Out-Null
+        $wingetPath = Get-WingetCommandPath
+        if ($wingetPath) { return $wingetPath }
+    }
+
+    Add-NeedsApproval 'winget.exe is still unavailable after PATH/App Installer repair attempts; Microsoft Store/App Installer may need manual repair.'
+    return $null
+}
+
+function Get-VcRuntimeState {
+    param([Parameter(Mandatory)][ValidateSet('x86','x64')][string]$Arch)
+    $key = "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\$Arch"
+    $item = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    if (-not $item -and $Arch -eq 'x86') {
+        $item = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\$Arch" -ErrorAction SilentlyContinue
+    }
+    if (-not $item) {
+        return [pscustomobject]@{ Installed = $false; Version = $null; RawVersion = $null }
+    }
+    $raw = if ($item.Version) { [string]$item.Version } else { '{0}.{1}.{2}.{3}' -f $item.Major,$item.Minor,$item.Bld,$item.Rbld }
+    return [pscustomobject]@{ Installed = ($item.Installed -eq 1); Version = (ConvertTo-SafeVersion $raw); RawVersion = $raw }
+}
+
+function Update-VcRuntime {
+    param([Parameter(Mandatory)][ValidateSet('x86','x64')][string]$Arch)
+    $state = Get-VcRuntimeState -Arch $Arch
+    $cacheRoot = Join-Path $Root 'tools\vcredist-cache'
+    $installer = Join-Path $cacheRoot "vc_redist.$Arch.exe"
+    $uri = "https://aka.ms/vc14/vc_redist.$Arch.exe"
+
+    $needsDownload = -not (Test-Path -LiteralPath $installer -PathType Leaf)
+    if ($needsDownload) {
+        if ($PlanOnly) {
+            Add-Skipped "PlanOnly: would download latest Visual C++ v14 $Arch redistributable from Microsoft."
+            return
+        }
+        try {
+            New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing -ErrorAction Stop
+            Add-Changed "Downloaded latest Visual C++ v14 $Arch redistributable from Microsoft."
+        } catch {
+            Add-NeedsApproval "Could not download Visual C++ v14 $Arch redistributable from Microsoft: $($_.Exception.Message)"
+            return
+        }
+    }
+
+    $latestVersion = ConvertTo-SafeVersion ((Get-Item -LiteralPath $installer).VersionInfo.ProductVersion)
+    if ($state.Installed -and $state.Version -and $latestVersion -and $state.Version -ge $latestVersion) {
+        Add-Verified "Visual C++ v14 $Arch runtime is current enough: installed $($state.RawVersion), installer $latestVersion."
+        return
+    }
+
+    if ($PlanOnly) {
+        Add-Skipped "PlanOnly: would install/update Visual C++ v14 $Arch runtime from Microsoft installer."
+        return
+    }
+
+    try {
+        $process = Start-Process -FilePath $installer -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru -WindowStyle Hidden
+        if ($process.ExitCode -in 0,1638,3010) {
+            if ($process.ExitCode -eq 3010) { Add-NeedsApproval "Visual C++ v14 $Arch runtime installer requested reboot; no reboot was performed." }
+            Add-Changed "Installed or repaired Visual C++ v14 $Arch runtime with Microsoft installer."
+        } else {
+            Add-NeedsApproval "Visual C++ v14 $Arch installer exited with code $($process.ExitCode); manual review may be needed."
+        }
+    } catch {
+        Add-NeedsApproval "Visual C++ v14 $Arch installer could not run: $($_.Exception.Message)"
+    }
 }
 
 function Test-Admin {
@@ -737,21 +877,22 @@ function Repair-StoreWingetAndAppx {
             Add-Skipped "$svcName is not installed; skipped Store dependency start repair."
         }
     }
-    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-    if ($winget) {
-        $wingetPath = $winget.Source
+    $wingetPath = Repair-WingetAvailability
+    if ($wingetPath) {
         $sourceOutput = & $wingetPath source list 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Add-Verified 'winget exists and source list works.'
+            Add-Verified "winget exists and source list works: $wingetPath"
         } else {
-            Add-NeedsApproval "winget exists but source list failed; source reset is available but was not run automatically: $($sourceOutput -join ' ')"
-        }
-    } else {
-        $appInstaller = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue
-        if ($appInstaller) {
-            Add-Verified 'App Installer package exists; winget command may need WindowsApps alias/session refresh.'
-        } else {
-            Add-NeedsApproval 'App Installer/winget is missing; Microsoft Store/App Installer reinstall is needed.'
+            if (-not $PlanOnly) {
+                $resetOutput = & $wingetPath source reset --force 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Add-Changed 'Reset winget sources after source list failed.'
+                } else {
+                    Add-NeedsApproval "winget exists but source reset failed: $($resetOutput -join ' ')"
+                }
+            } else {
+                Add-Skipped "PlanOnly: would reset winget sources after source list failed: $($sourceOutput -join ' ')"
+            }
         }
     }
     $store = Get-AppxPackage -Name Microsoft.WindowsStore -AllUsers -ErrorAction SilentlyContinue
@@ -911,8 +1052,7 @@ function Repair-NetworkStackExpanded {
 function Repair-RuntimesAndAppPrerequisites {
     if (-not (Test-ModuleEnabled -Name 'Runtimes')) { return }
     Write-Log 'Checking Visual C++, DirectX, WebView2, Gaming runtime, browser, and app prerequisite gates.'
-    $vcKeys = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\*' -ErrorAction SilentlyContinue)
-    if ($vcKeys.Count -gt 0) { Add-Verified 'Visual C++ 2015-2022 runtime registry entries exist.' } else { Add-NeedsApproval 'Visual C++ 2015-2022 runtime registry entries were not found.' }
+    foreach ($arch in 'x64','x86') { Update-VcRuntime -Arch $arch }
     $dx = Join-Path $env:SystemRoot 'System32\xinput1_4.dll'
     if (Test-Path -LiteralPath $dx -PathType Leaf) { Add-Verified 'DirectX/XInput core runtime file exists.' } else { Add-NeedsApproval 'DirectX/XInput core runtime file is missing.' }
     $defaultBrowser = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice' -ErrorAction SilentlyContinue).ProgId

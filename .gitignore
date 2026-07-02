@@ -1,5 +1,6 @@
 logs/
 tools/dotnet-runtime-cache/
+tools/vcredist-cache/
 *.tmp
 *.bak
 *.user

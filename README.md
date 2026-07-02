@@ -51,7 +51,7 @@ F:\study\Windows\Repair\AudioBluetoothWifiRepair\bin\AudioBluetoothWifiRepair.ex
 - Windows Update, BITS, Update Orchestrator, Windows Modules Installer, MSI Installer, Cryptographic Services, and Windows Time service startup state are repaired only when current state is wrong.
 - Cryptographic Services and BITS are started only when stopped, so certificate, update, and package validation failures can recover without repeated restarts.
 - Pending reboot registry markers are detected and reported for approval instead of forcing a reboot.
-- Microsoft Store/AppX infrastructure, Client License Service, Install Service, Gaming Services, winget sources, Microsoft Store registration, and WebView2 registration are checked; missing or broken user-impacting app repairs are reported without destructive resets.
+- Microsoft Store/AppX infrastructure, Client License Service, Install Service, Gaming Services, winget sources, Microsoft Store registration, and WebView2 registration are checked; missing winget/App Installer alias state is repaired by PATH repair, App Installer re-registration, or the official Microsoft winget package when needed.
 - PowerShell profile syntax, Windows Terminal availability, and safe user PATH entries for System32, Windows, WindowsPowerShell, WindowsApps, user bin, and dotnet are checked and repaired additively.
 - Common developer/runtime commands are checked: `git`, `python`, `py`, `node`, `npm`, `ssh`, and `dotnet`.
 - Base Filtering Engine, Windows Firewall, Windows Security Center, Defender services, Credential Manager, and elevation broker services are checked and repaired when disabled or stopped.
@@ -60,7 +60,8 @@ F:\study\Windows\Repair\AudioBluetoothWifiRepair\bin\AudioBluetoothWifiRepair.ex
 - Spooler, camera frame server, clipboard user service, font cache, HID service, tablet input, and power service state are checked and repaired only when needed.
 - Workstation, Server, NetBIOS helper, RDP-related services, and IP Helper are checked for safe startup/running state.
 - WinHTTP proxy, user proxy settings, and VPN-like adapters are detected and reported without destructive reset.
-- VC++ runtime registry, DirectX/XInput presence, and default browser association are checked.
+- Visual C++ v14 x64 and x86 redistributables are checked and repaired independently of winget by using Microsoft's official latest-supported redistributable permalinks, so `winget not found` can no longer skip the Visual C++ runtime update check.
+- DirectX/XInput presence and default browser association are checked.
 - `TEMP`, `TMP`, `ComSpec`, `Path`, temp directories, and core file associations for `.exe`, `.lnk`, `.cmd`, `.bat`, `.ps1`, `.msi`, and `.zip` are checked; missing associations are reported for review instead of blindly rewriting registry state.
 - Recent Application event log failures for .NET Runtime, Application Error, Application Popup, and MSI Installer are scanned and folded into the report.
 - Optional deep repair mode runs non-destructive health checks only: DISM ScanHealth, SFC verifyonly, WMI repository verification, and disk dirty query.
