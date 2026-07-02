@@ -1,7 +1,10 @@
 param(
     [switch]$NoPause,
     [switch]$NoSoundTest,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$PlanOnly,
+    [switch]$DeepRepair,
+    [string[]]$Module = @('All')
 )
 
 $ErrorActionPreference = 'Continue'
@@ -9,6 +12,7 @@ $script:HadError = $false
 $script:ChangedItems = New-Object System.Collections.Generic.List[string]
 $script:VerifiedItems = New-Object System.Collections.Generic.List[string]
 $script:SkippedItems = New-Object System.Collections.Generic.List[string]
+$script:NeedsApprovalItems = New-Object System.Collections.Generic.List[string]
 $Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $LogDir = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -37,6 +41,42 @@ function Add-Skipped {
     param([string]$Message)
     $script:SkippedItems.Add($Message) | Out-Null
     Write-Log $Message 'SKIP'
+}
+
+function Add-NeedsApproval {
+    param([string]$Message)
+    $script:NeedsApprovalItems.Add($Message) | Out-Null
+    Write-Log $Message 'APPROVAL'
+}
+
+function Test-ModuleEnabled {
+    param([Parameter(Mandatory)][string]$Name)
+    return ($Module -contains 'All' -or $Module -contains $Name)
+}
+
+function Invoke-RepairAction {
+    param(
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+    if ($PlanOnly) {
+        Add-Skipped "PlanOnly: would repair $Description."
+        return $true
+    }
+    try {
+        & $Action
+        Add-Changed $Description
+        return $true
+    } catch {
+        $script:HadError = $true
+        Write-Log "Failed to repair $Description`: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
+function Test-CommandAvailable {
+    param([Parameter(Mandatory)][string]$Name)
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
 function Test-Admin {
@@ -81,8 +121,12 @@ function Set-ServiceStartModeSafe {
         'disabled' { 'DISABLED' }
     }
     if ($current -notmatch $targetLabel) {
-        [void](Invoke-Sc -Args @('config', $Name, "start= $Start"))
-        Add-Changed "Set $Name startup to $Start."
+        $code = Invoke-Sc -Args @('config', $Name, 'start=', $Start)
+        if ($code -eq 0) {
+            Add-Changed "Set $Name startup to $Start."
+        } else {
+            Add-NeedsApproval "Service $Name did not accept startup mode $Start automatically; sc.exe exit code $code."
+        }
     } else {
         Add-Verified "$Name startup already $Start."
     }
@@ -636,7 +680,322 @@ function Repair-DotNetRuntimeMismatch {
     Repair-DotNetInstallRegistryMetadata
 }
 
+function Repair-WindowsUpdateAndCrypto {
+    if (-not (Test-ModuleEnabled -Name 'Update')) { return }
+    Write-Log 'Checking Windows Update, installer, cryptographic, certificate, and time repair gates.'
+    foreach ($entry in @(
+        @{Name='wuauserv'; Start='demand'},
+        @{Name='bits'; Start='demand'},
+        @{Name='UsoSvc'; Start='demand'},
+        @{Name='WaaSMedicSvc'; Start='demand'},
+        @{Name='cryptsvc'; Start='auto'},
+        @{Name='msiserver'; Start='demand'},
+        @{Name='TrustedInstaller'; Start='demand'},
+        @{Name='W32Time'; Start='demand'}
+    )) {
+        Set-ServiceStartModeSafe -Name $entry.Name -Start $entry.Start
+    }
+    foreach ($name in 'cryptsvc','bits','wuauserv','msiserver') {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Stopped' -and $name -in 'cryptsvc','bits') {
+            Start-ServiceSafe -Name $name
+        } elseif ($svc) {
+            Add-Verified "$name is installed; start is left on-demand unless needed."
+        }
+    }
+    $rebootKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    )
+    foreach ($key in $rebootKeys) {
+        if ($key -like '*Session Manager') {
+            $pending = (Get-ItemProperty -LiteralPath $key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+            if ($pending) { Add-NeedsApproval 'A reboot is pending because PendingFileRenameOperations exists; no reboot was performed.' }
+        } elseif (Test-Path -LiteralPath $key) {
+            Add-NeedsApproval "A reboot is pending because $key exists; no reboot was performed."
+        }
+    }
+    $certAutoUpdate = 'HKLM:\Software\Policies\Microsoft\SystemCertificates\AuthRoot'
+    $disableRoot = (Get-ItemProperty -LiteralPath $certAutoUpdate -Name DisableRootAutoUpdate -ErrorAction SilentlyContinue).DisableRootAutoUpdate
+    if ($disableRoot -eq 1) {
+        Add-NeedsApproval 'Root certificate auto-update is blocked by policy; left unchanged.'
+    } else {
+        Add-Verified 'Root certificate auto-update is not blocked by the common policy key.'
+    }
+}
+
+function Repair-StoreWingetAndAppx {
+    if (-not (Test-ModuleEnabled -Name 'Store')) { return }
+    Write-Log 'Checking Microsoft Store, AppX, Winget, Gaming Services, and WebView2 gates.'
+    foreach ($svcName in 'AppXSvc','ClipSVC','InstallService','GamingServices','GamingServicesNet') {
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc) {
+            Set-ServiceStartModeSafe -Name $svcName -Start 'demand'
+            Add-Verified "$svcName is installed for Store/AppX workflows."
+        } else {
+            Add-Skipped "$svcName is not installed; skipped Store dependency start repair."
+        }
+    }
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($winget) {
+        $wingetPath = $winget.Source
+        $sourceOutput = & $wingetPath source list 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Add-Verified 'winget exists and source list works.'
+        } else {
+            Add-NeedsApproval "winget exists but source list failed; source reset is available but was not run automatically: $($sourceOutput -join ' ')"
+        }
+    } else {
+        $appInstaller = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue
+        if ($appInstaller) {
+            Add-Verified 'App Installer package exists; winget command may need WindowsApps alias/session refresh.'
+        } else {
+            Add-NeedsApproval 'App Installer/winget is missing; Microsoft Store/App Installer reinstall is needed.'
+        }
+    }
+    $store = Get-AppxPackage -Name Microsoft.WindowsStore -AllUsers -ErrorAction SilentlyContinue
+    if ($store) { Add-Verified 'Microsoft Store package is registered.' } else { Add-NeedsApproval 'Microsoft Store package is missing or not registered.' }
+    $webView = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\*' -ErrorAction SilentlyContinue | Where-Object { $_.name -match 'WebView2' }
+    if ($webView) { Add-Verified 'Microsoft Edge WebView2 runtime registration exists.' } else { Add-NeedsApproval 'WebView2 runtime registration was not found; installer repair may be needed.' }
+}
+
+function Repair-PowerShellTerminalAndPath {
+    if (-not (Test-ModuleEnabled -Name 'Shell')) { return }
+    Write-Log 'Checking PowerShell, Terminal, app aliases, PATH, and developer tool gates.'
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+    $pathText = "$machinePath;$userPath"
+    foreach ($path in @(
+        "$env:SystemRoot\System32",
+        "$env:SystemRoot",
+        "$env:SystemRoot\System32\WindowsPowerShell\v1.0",
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps",
+        "$env:USERPROFILE\bin",
+        "$env:ProgramFiles\dotnet"
+    )) {
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+            Add-Skipped "PATH candidate does not exist: $path"
+        } elseif ($pathText -notlike "*$path*") {
+            Invoke-RepairAction -Description "Added missing user PATH entry $path" -Action {
+                $current = [Environment]::GetEnvironmentVariable('Path','User')
+                if ($null -eq $current) { $current = '' }
+                if ([string]::IsNullOrWhiteSpace($current)) {
+                    [Environment]::SetEnvironmentVariable('Path', $path, 'User')
+                } else {
+                    [Environment]::SetEnvironmentVariable('Path', ($current.TrimEnd(';') + ';' + $path), 'User')
+                }
+            } | Out-Null
+        } else {
+            Add-Verified "PATH already contains $path."
+        }
+    }
+    foreach ($profilePath in @(
+        "$env:USERPROFILE\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1",
+        "$env:USERPROFILE\Documents\PowerShell\Microsoft.PowerShell_profile.ps1"
+    )) {
+        if (Test-Path -LiteralPath $profilePath -PathType Leaf) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($profilePath, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+                $script:HadError = $true
+                Write-Log "PowerShell profile parse errors in $profilePath`: $($errors[0].Message)" 'ERROR'
+            } else {
+                Add-Verified "PowerShell profile parses cleanly: $profilePath"
+            }
+        } else {
+            $parent = Split-Path -Parent $profilePath
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+                Invoke-RepairAction -Description "Created missing PowerShell profile folder $parent" -Action { New-Item -ItemType Directory -Force -Path $parent | Out-Null } | Out-Null
+            } else {
+                Add-Skipped "PowerShell profile file is absent but folder exists: $profilePath"
+            }
+        }
+    }
+    $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+    if ($wt) { Add-Verified "Windows Terminal launcher resolves to $($wt.Source)." } else { Add-NeedsApproval 'wt.exe was not found; Terminal/App Execution Alias repair may be needed.' }
+    foreach ($cmd in 'git.exe','python.exe','py.exe','node.exe','npm.cmd','ssh.exe','dotnet.exe') {
+        if (Get-Command $cmd -ErrorAction SilentlyContinue) { Add-Verified "$cmd resolves." } else { Add-Skipped "$cmd is not currently available on PATH." }
+    }
+}
+
+function Repair-SecurityFirewallAndDefender {
+    if (-not (Test-ModuleEnabled -Name 'Security')) { return }
+    Write-Log 'Checking firewall, Defender, Security Center, UAC, and credential service gates.'
+    foreach ($entry in @(
+        @{Name='BFE'; Start='auto'},
+        @{Name='mpssvc'; Start='auto'},
+        @{Name='SecurityHealthService'; Start='demand'},
+        @{Name='wscsvc'; Start='demand'},
+        @{Name='WinDefend'; Start='auto'},
+        @{Name='WdNisSvc'; Start='demand'},
+        @{Name='VaultSvc'; Start='demand'},
+        @{Name='Appinfo'; Start='demand'}
+    )) {
+        Set-ServiceStartModeSafe -Name $entry.Name -Start $entry.Start
+    }
+    foreach ($name in 'BFE','mpssvc') { Start-ServiceSafe -Name $name }
+    $profiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+    if ($profiles) {
+        foreach ($profile in $profiles) {
+            if ($profile.Enabled) { Add-Verified "Firewall profile $($profile.Name) is enabled." } else { Add-NeedsApproval "Firewall profile $($profile.Name) is disabled; not changed automatically." }
+        }
+    } else {
+        Add-Skipped 'Firewall profile cmdlets unavailable; skipped firewall profile verification.'
+    }
+}
+
+function Repair-DevicesInputUsbDisplayPrinterCamera {
+    if (-not (Test-ModuleEnabled -Name 'Devices')) { return }
+    Write-Log 'Checking USB, HID/input, display, printer, camera, microphone, clipboard, and font gates.'
+    foreach ($entry in @(
+        @{Name='hidserv'; Start='demand'},
+        @{Name='TabletInputService'; Start='demand'},
+        @{Name='Spooler'; Start='auto'},
+        @{Name='FrameServer'; Start='demand'},
+        @{Name='cbdhsvc'; Start='demand'},
+        @{Name='FontCache'; Start='auto'},
+        @{Name='Power'; Start='auto'}
+    )) {
+        Set-ServiceStartModeSafe -Name $entry.Name -Start $entry.Start
+    }
+    foreach ($class in 'USB','HIDClass','Keyboard','Mouse','Monitor','Display','Camera','MEDIA','AudioEndpoint','PrintQueue') {
+        $bad = @(Get-PnpDevice -Class $class -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Error' -or $_.Status -eq 'Disabled' })
+        if ($bad.Count -eq 0) {
+            Add-Verified "No disabled/error PnP devices found for class $class."
+        } else {
+            foreach ($dev in $bad) {
+                if ($dev.Status -eq 'Disabled') {
+                    Invoke-RepairAction -Description "Enabled disabled $class device $($dev.FriendlyName)" -Action { Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop } | Out-Null
+                } else {
+                    Add-NeedsApproval "$class device has error status and may need driver repair: $($dev.FriendlyName) / $($dev.InstanceId)"
+                }
+            }
+        }
+    }
+}
+
+function Repair-NetworkStackExpanded {
+    if (-not (Test-ModuleEnabled -Name 'Network')) { return }
+    Write-Log 'Checking expanded network, VPN, proxy, SMB, RDP, and sharing gates.'
+    foreach ($entry in @(
+        @{Name='LanmanWorkstation'; Start='auto'},
+        @{Name='LanmanServer'; Start='auto'},
+        @{Name='lmhosts'; Start='demand'},
+        @{Name='TermService'; Start='demand'},
+        @{Name='SessionEnv'; Start='demand'},
+        @{Name='UmRdpService'; Start='demand'},
+        @{Name='iphlpsvc'; Start='auto'}
+    )) {
+        Set-ServiceStartModeSafe -Name $entry.Name -Start $entry.Start
+    }
+    $winHttpProxy = & "$env:SystemRoot\System32\netsh.exe" winhttp show proxy 2>&1
+    if (($winHttpProxy -join "`n") -match 'Direct access') {
+        Add-Verified 'WinHTTP proxy is direct.'
+    } else {
+        Add-NeedsApproval "WinHTTP proxy is configured; not reset automatically: $($winHttpProxy -join ' ')"
+    }
+    $proxyEnabled = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable
+    if ($proxyEnabled -eq 1) {
+        Add-NeedsApproval 'User proxy is enabled; not changed automatically.'
+    } else {
+        Add-Verified 'User proxy is not enabled.'
+    }
+    $vpnAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -match 'VPN|TAP|Wintun|WireGuard|OpenVPN|Tailscale|ZeroTier' })
+    foreach ($adapter in $vpnAdapters) {
+        if ($adapter.Status -eq 'Disabled') { Add-Skipped "VPN-like adapter is disabled: $($adapter.Name)" } else { Add-Verified "VPN-like adapter present: $($adapter.Name) / $($adapter.Status)" }
+    }
+}
+
+function Repair-RuntimesAndAppPrerequisites {
+    if (-not (Test-ModuleEnabled -Name 'Runtimes')) { return }
+    Write-Log 'Checking Visual C++, DirectX, WebView2, Gaming runtime, browser, and app prerequisite gates.'
+    $vcKeys = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\*' -ErrorAction SilentlyContinue)
+    if ($vcKeys.Count -gt 0) { Add-Verified 'Visual C++ 2015-2022 runtime registry entries exist.' } else { Add-NeedsApproval 'Visual C++ 2015-2022 runtime registry entries were not found.' }
+    $dx = Join-Path $env:SystemRoot 'System32\xinput1_4.dll'
+    if (Test-Path -LiteralPath $dx -PathType Leaf) { Add-Verified 'DirectX/XInput core runtime file exists.' } else { Add-NeedsApproval 'DirectX/XInput core runtime file is missing.' }
+    $defaultBrowser = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice' -ErrorAction SilentlyContinue).ProgId
+    if ($defaultBrowser) { Add-Verified "Default HTTP browser association exists: $defaultBrowser" } else { Add-NeedsApproval 'Default HTTP browser association was not found.' }
+}
+
+function Repair-EnvironmentTempAndAssociations {
+    if (-not (Test-ModuleEnabled -Name 'Environment')) { return }
+    Write-Log 'Checking environment variables, TEMP folders, app aliases, and core file associations.'
+    foreach ($var in 'TEMP','TMP','USERPROFILE','ProgramFiles','ComSpec','PATHEXT') {
+        $value = [Environment]::GetEnvironmentVariable($var)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            $script:HadError = $true
+            Write-Log "Critical environment variable $var is empty." 'ERROR'
+        } else {
+            Add-Verified "Environment variable $var is set."
+        }
+    }
+    foreach ($temp in @($env:TEMP, $env:TMP)) {
+        if ([string]::IsNullOrWhiteSpace($temp)) { continue }
+        if (-not (Test-Path -LiteralPath $temp -PathType Container)) {
+            Invoke-RepairAction -Description "Created missing temp folder $temp" -Action { New-Item -ItemType Directory -Force -Path $temp | Out-Null } | Out-Null
+        } else {
+            Add-Verified "Temp folder exists: $temp"
+        }
+    }
+    $assocChecks = @{
+        '.exe'='exefile';
+        '.lnk'='lnkfile';
+        '.cmd'='cmdfile';
+        '.bat'='batfile';
+        '.ps1'='Microsoft.PowerShellScript.1';
+        '.msi'='Msi.Package';
+        '.zip'='CompressedFolder'
+    }
+    foreach ($ext in $assocChecks.Keys) {
+        $assocKey = Get-Item -LiteralPath "Registry::HKEY_CLASSES_ROOT\$ext" -ErrorAction SilentlyContinue
+        $actual = $null
+        if ($assocKey) { $actual = $assocKey.GetValue('') }
+        if ($actual) { Add-Verified "$ext association exists as $actual." } else { Add-NeedsApproval "$ext association is missing; not recreated automatically." }
+    }
+}
+
+function Invoke-DeepRepairIfRequested {
+    if (-not $DeepRepair) {
+        Add-Skipped 'DeepRepair not requested; skipped DISM/SFC/WMI/storage deep repair commands.'
+        return
+    }
+    Write-Log 'DeepRepair requested; running verification-first component checks.'
+    Invoke-RepairAction -Description 'Ran DISM ScanHealth' -Action { & "$env:SystemRoot\System32\dism.exe" /Online /Cleanup-Image /ScanHealth | ForEach-Object { if ($_){ Write-Log "DISM: $_" } } } | Out-Null
+    Invoke-RepairAction -Description 'Ran SFC verify-only scan' -Action { & "$env:SystemRoot\System32\sfc.exe" /verifyonly | ForEach-Object { if ($_){ Write-Log "SFC: $_" } } } | Out-Null
+    $winmgmt = & "$env:SystemRoot\System32\wbem\winmgmt.exe" /verifyrepository 2>&1
+    foreach ($line in $winmgmt) { if ($line) { Write-Log "WMI verify: $line" } }
+    Add-Verified 'WMI repository verification command completed.'
+    $dirty = & "$env:SystemRoot\System32\fsutil.exe" dirty query $env:SystemDrive 2>&1
+    foreach ($line in $dirty) { if ($line) { Write-Log "Disk dirty query: $line" } }
+}
+
+function Invoke-RecentIssueScanner {
+    if (-not (Test-ModuleEnabled -Name 'Events')) { return }
+    Write-Log 'Scanning recent event log and visible popup evidence for known repairable patterns.'
+    $start = (Get-Date).AddHours(-6)
+    $events = @(Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=$start} -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProviderName -in '.NET Runtime','Application Error','Application Popup','MsiInstaller' } |
+        Select-Object -First 30)
+    if ($events.Count -eq 0) {
+        Add-Verified 'No recent known application/runtime/installer error events found in the scan window.'
+    } else {
+        foreach ($event in $events) {
+            $message = ($event.Message -replace '\s+', ' ')
+            if ($message -match 'FrameworkMissingFailure|hostfxr_initialize|dotnet\.exe') {
+                Add-Verified 'Recent .NET failure pattern covered by .NET runtime mismatch repair.'
+            } elseif ($message -match 'MsiInstaller') {
+                Add-NeedsApproval "Recent MSI installer event needs review: $($event.TimeCreated) / $($event.Id)"
+            } else {
+                Add-Skipped "Recent event recorded for review: $($event.ProviderName) $($event.Id) $($event.TimeCreated)"
+            }
+        }
+    }
+}
+
 function Set-PlaybackRoute {
+    if (-not (Test-ModuleEnabled 'Audio')) { return }
     Write-Log 'Repairing default playback route and system volume.'
     $nircmd = Join-Path $env:SystemRoot 'System32\nircmd.exe'
     if (-not (Test-Path -LiteralPath $nircmd)) {
@@ -648,6 +1007,10 @@ function Set-PlaybackRoute {
     $activeNames = @(Get-RenderEndpoints | Where-Object { $_.State -eq 1 } | ForEach-Object { $_.Name })
     if ($activeNames -contains 'M27UP') {
         Add-Verified 'M27UP is already an active render endpoint before route enforcement.'
+    }
+    if ($PlanOnly) {
+        Add-Skipped 'PlanOnly: would enforce preferred playback route and volume only if audio repair was requested.'
+        return
     }
     foreach ($device in $preferredDevices) {
         foreach ($role in 0,1,2) {
@@ -777,6 +1140,9 @@ function Write-Summary {
     Write-Host 'Skipped because already good or not installed:'
     foreach ($item in $script:SkippedItems) { Write-Host " - $item" }
     Write-Host ''
+    Write-Host 'Needs approval or manual review:'
+    foreach ($item in $script:NeedsApprovalItems) { Write-Host " - $item" }
+    Write-Host ''
     Write-Host 'Verified:'
     foreach ($item in $script:VerifiedItems) { Write-Host " - $item" }
     Write-Host ''
@@ -785,6 +1151,26 @@ function Write-Summary {
     } else {
         Write-Host 'Result: repair completed and verification passed.'
     }
+}
+
+function Write-JsonReport {
+    $report = [pscustomobject]@{
+        Timestamp = (Get-Date).ToString('o')
+        Executable = Join-Path $Root 'bin\AudioBluetoothWifiRepair.exe'
+        Script = $PSCommandPath
+        Log = $LogPath
+        PlanOnly = [bool]$PlanOnly
+        DeepRepair = [bool]$DeepRepair
+        Modules = @($Module)
+        FixedOrEnforced = @($script:ChangedItems)
+        Skipped = @($script:SkippedItems)
+        NeedsApproval = @($script:NeedsApprovalItems)
+        Verified = @($script:VerifiedItems)
+        HadError = [bool]$script:HadError
+    }
+    $jsonPath = [System.IO.Path]::ChangeExtension($LogPath, '.json')
+    $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+    Write-Log "JSON report: $jsonPath"
 }
 
 Write-Log 'AudioBluetoothWifiRepair started.'
@@ -807,9 +1193,20 @@ Repair-NetworkInterfaces
 Repair-PnpDevices
 Repair-DnsAndConnectivity
 Repair-DotNetRuntimeMismatch
+Repair-WindowsUpdateAndCrypto
+Repair-StoreWingetAndAppx
+Repair-PowerShellTerminalAndPath
+Repair-SecurityFirewallAndDefender
+Repair-DevicesInputUsbDisplayPrinterCamera
+Repair-NetworkStackExpanded
+Repair-RuntimesAndAppPrerequisites
+Repair-EnvironmentTempAndAssociations
+Invoke-RecentIssueScanner
+Invoke-DeepRepairIfRequested
 Set-PlaybackRoute
 Verify-CurrentState
-if (-not $SelfTest) { Play-SoundTest }
+if ((Test-ModuleEnabled 'Audio') -and -not $PlanOnly -and -not $SelfTest) { Play-SoundTest }
+Write-JsonReport
 Write-Summary
 
 if (-not $NoPause) {
