@@ -38,6 +38,7 @@ The executable relaunches elevated if needed, then runs `scripts\Repair-AudioBlu
 - Disabled audio, Bluetooth, and network Plug and Play devices re-enabled when found.
 - DNS cache flushed and DNS registration refreshed only when DNS resolution is broken.
 - DHCP lease renewed only when internet connectivity is broken and no IPv4 address is detected.
+- Missing .NET preview shared runtimes, SDK Windows runtime-target files, and x64 install registry metadata are restored additively when a machine-wide SDK exists without its matching payload, which prevents `dotnet.exe - System Error` hard-error popups caused by `FrameworkMissingFailure` and keeps `dotnet --info` healthy.
 - Default playback route repaired through the proven monitor endpoints, ending on `M27UP`.
 - System audio unmuted and volume set to 87.5%.
 - Audio endpoint, Bluetooth, WiFi, Ethernet, DNS, internet connectivity, and service state verified.

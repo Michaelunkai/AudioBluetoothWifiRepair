@@ -1,4 +1,5 @@
 logs/
+tools/dotnet-runtime-cache/
 *.tmp
 *.bak
 *.user

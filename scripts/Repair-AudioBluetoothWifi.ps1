@@ -326,6 +326,316 @@ function Repair-DnsAndConnectivity {
     }
 }
 
+function Get-DotNetRuntimeVersionForSdk {
+    param([Parameter(Mandatory)][string]$SdkVersion)
+    if ($SdkVersion -match '^(\d+)\.0\.100-(.+)$') {
+        return ('{0}.0.0-{1}' -f $matches[1], $matches[2])
+    }
+    if ($SdkVersion -match '^(\d+)\.(\d+)\.(\d+)$') {
+        return $null
+    }
+    return $null
+}
+
+function Test-DotNetRuntimePayload {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeFolder,
+        [Parameter(Mandatory)][string]$RuntimePath
+    )
+    if (-not (Test-Path -LiteralPath $RuntimePath -PathType Container)) {
+        return $false
+    }
+    if ($RuntimeFolder -eq 'Microsoft.NETCore.App') {
+        return (Test-Path -LiteralPath (Join-Path $RuntimePath 'System.Private.CoreLib.dll') -PathType Leaf)
+    }
+    if ($RuntimeFolder -eq 'Microsoft.WindowsDesktop.App') {
+        return (Test-Path -LiteralPath (Join-Path $RuntimePath 'PresentationCore.dll') -PathType Leaf)
+    }
+    return $false
+}
+
+function Get-DotNetRuntimeArchiveUrl {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeName,
+        [Parameter(Mandatory)][string]$Version
+    )
+    if ($RuntimeName -eq 'dotnet') {
+        return "https://builds.dotnet.microsoft.com/dotnet/Runtime/$Version/dotnet-runtime-$Version-win-x64.zip"
+    }
+    if ($RuntimeName -eq 'windowsdesktop') {
+        return "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/$Version/windowsdesktop-runtime-$Version-win-x64.zip"
+    }
+    throw "Unsupported .NET runtime payload: $RuntimeName"
+}
+
+function Expand-DotNetSharedRuntimePayload {
+    param(
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$RuntimeFolder,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$RuntimePath
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $prefix = "shared/$RuntimeFolder/$Version/"
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    $extracted = 0
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrWhiteSpace($entry.Name)) { continue }
+            if (-not $entry.FullName.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $relative = $entry.FullName.Substring($prefix.Length).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+            $target = Join-Path $RuntimePath $relative
+            $targetDirectory = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
+            }
+            if (Test-Path -LiteralPath $target -PathType Leaf) { continue }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+            $extracted++
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    return $extracted
+}
+
+function Expand-DotNetSdkRuntimeTargetsPayload {
+    param(
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$SdkVersion,
+        [Parameter(Mandatory)][string]$SdkPath,
+        [Parameter(Mandatory)][string]$TargetRelativeRoot
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $prefix = "sdk/$SdkVersion/$($TargetRelativeRoot.Replace('\','/'))/"
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    $extracted = 0
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrWhiteSpace($entry.Name)) { continue }
+            if (-not $entry.FullName.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $relative = $entry.FullName.Substring(("sdk/$SdkVersion/").Length).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+            if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+            $target = Join-Path $SdkPath $relative
+            $targetDirectory = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
+            }
+            if (Test-Path -LiteralPath $target -PathType Leaf) { continue }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+            $extracted++
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    return $extracted
+}
+
+function Install-DotNetRuntimeIfMissing {
+    param(
+        [Parameter(Mandatory)][string]$RuntimeName,
+        [Parameter(Mandatory)][string]$RuntimeFolder,
+        [Parameter(Mandatory)][string]$Version
+    )
+    $dotnetRoot = Join-Path $env:ProgramFiles 'dotnet'
+    $runtimePath = Join-Path (Join-Path (Join-Path $dotnetRoot 'shared') $RuntimeFolder) $Version
+    if (Test-DotNetRuntimePayload -RuntimeFolder $RuntimeFolder -RuntimePath $runtimePath) {
+        Add-Verified "$RuntimeName $Version already installed."
+        return
+    }
+
+    $cacheRoot = Join-Path $Root 'tools\dotnet-runtime-cache'
+    if (-not (Test-Path -LiteralPath $cacheRoot -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $runtimePath -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $runtimePath | Out-Null
+    }
+
+    $archiveUrl = Get-DotNetRuntimeArchiveUrl -RuntimeName $RuntimeName -Version $Version
+    $archivePath = Join-Path $cacheRoot ([System.IO.Path]::GetFileName($archiveUrl))
+    Write-Log "Installing missing $RuntimeName $Version shared runtime from $archiveUrl."
+    try {
+        if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec 180
+        } else {
+            Write-Log "Using cached .NET runtime archive $archivePath."
+        }
+        $extracted = Expand-DotNetSharedRuntimePayload -ArchivePath $archivePath -RuntimeFolder $RuntimeFolder -Version $Version -RuntimePath $runtimePath
+        Write-Log "Extracted $extracted missing $RuntimeFolder files for $Version without replacing dotnet.exe."
+    } catch {
+        $script:HadError = $true
+        Write-Log "Failed to install missing $RuntimeName $Version`: $($_.Exception.Message)" 'ERROR'
+        return
+    }
+
+    if (Test-DotNetRuntimePayload -RuntimeFolder $RuntimeFolder -RuntimePath $runtimePath) {
+        Add-Changed "Installed missing $RuntimeName $Version shared runtime payload."
+    } else {
+        $script:HadError = $true
+        Write-Log "Missing $RuntimeName $Version payload validation file after extraction." 'ERROR'
+    }
+}
+
+function Repair-DotNetSdkRuntimeTargets {
+    param(
+        [Parameter(Mandatory)][string]$SdkVersion,
+        [Parameter(Mandatory)][string]$SdkPath
+    )
+    if ($SdkVersion -notmatch '^(\d+)\.') { return }
+    $major = $matches[1]
+    $targetRelativeRoot = "runtimes\win\lib\net$major.0"
+    $targetRoot = Join-Path $SdkPath $targetRelativeRoot
+    $requiredFiles = @(
+        'System.ServiceProcess.ServiceController.dll',
+        'System.Diagnostics.EventLog.dll',
+        'System.Diagnostics.EventLog.Messages.dll',
+        'System.Security.Cryptography.Pkcs.dll'
+    )
+    $missing = @()
+    foreach ($fileName in $requiredFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $fileName) -PathType Leaf)) {
+            $missing += $fileName
+        }
+    }
+    if (-not $missing -or $missing.Count -eq 0) {
+        Add-Verified ".NET SDK $SdkVersion Windows runtime-target files already present."
+        return
+    }
+
+    $cacheRoot = Join-Path $Root 'tools\dotnet-runtime-cache'
+    if (-not (Test-Path -LiteralPath $cacheRoot -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+    }
+    $archiveUrl = "https://builds.dotnet.microsoft.com/dotnet/Sdk/$SdkVersion/dotnet-sdk-$SdkVersion-win-x64.zip"
+    $archivePath = Join-Path $cacheRoot ([System.IO.Path]::GetFileName($archiveUrl))
+    Write-Log "Restoring missing .NET SDK $SdkVersion Windows runtime-target files from $archiveUrl."
+    try {
+        if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            Invoke-WebRequest -Uri $archiveUrl -OutFile $archivePath -UseBasicParsing -TimeoutSec 240
+        } else {
+            Write-Log "Using cached .NET SDK archive $archivePath."
+        }
+        $extracted = Expand-DotNetSdkRuntimeTargetsPayload -ArchivePath $archivePath -SdkVersion $SdkVersion -SdkPath $SdkPath -TargetRelativeRoot $targetRelativeRoot
+        Write-Log "Extracted $extracted missing .NET SDK $SdkVersion runtime-target files without replacing dotnet.exe."
+    } catch {
+        $script:HadError = $true
+        Write-Log "Failed to restore .NET SDK $SdkVersion runtime-target files: $($_.Exception.Message)" 'ERROR'
+        return
+    }
+
+    $stillMissing = @()
+    foreach ($fileName in $requiredFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $fileName) -PathType Leaf)) {
+            $stillMissing += $fileName
+        }
+    }
+    if ($stillMissing.Count -eq 0) {
+        Add-Changed "Restored missing .NET SDK $SdkVersion Windows runtime-target files."
+    } else {
+        $script:HadError = $true
+        Write-Log "Still missing .NET SDK $SdkVersion runtime-target files: $($stillMissing -join ', ')" 'ERROR'
+    }
+}
+
+function Repair-DotNetInstallRegistryMetadata {
+    Write-Log 'Checking .NET x64 install registry metadata used by dotnet CLI workload/installer discovery.'
+    $dotnetRoot = Join-Path $env:ProgramFiles 'dotnet'
+    if (-not (Test-Path -LiteralPath $dotnetRoot -PathType Container)) {
+        Add-Skipped '.NET root folder not found; skipped .NET install registry metadata repair.'
+        return
+    }
+
+    $rootKeyPath = 'HKLM:\SOFTWARE\dotnet\Setup\InstalledVersions\x64'
+    if (-not (Test-Path -LiteralPath $rootKeyPath)) {
+        New-Item -Path $rootKeyPath -Force | Out-Null
+        Add-Changed 'Created missing .NET x64 InstalledVersions registry key.'
+    }
+    $currentInstallLocation = (Get-ItemProperty -LiteralPath $rootKeyPath -Name InstallLocation -ErrorAction SilentlyContinue).InstallLocation
+    if ($currentInstallLocation -ne ($dotnetRoot + '\')) {
+        New-ItemProperty -LiteralPath $rootKeyPath -Name InstallLocation -Value ($dotnetRoot + '\') -PropertyType String -Force | Out-Null
+        Add-Changed 'Repaired .NET x64 InstallLocation registry value.'
+    } else {
+        Add-Verified '.NET x64 InstallLocation registry value already correct.'
+    }
+
+    $hostFxrRoot = Join-Path $dotnetRoot 'host\fxr'
+    $hostVersion = $null
+    if (Test-Path -LiteralPath $hostFxrRoot -PathType Container) {
+        $hostVersion = Get-ChildItem -LiteralPath $hostFxrRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object { [version](($_.Name -replace '-.*$','')) } -Descending |
+            Select-Object -First 1 -ExpandProperty Name
+    }
+    if ($hostVersion) {
+        foreach ($subKey in @('hostfxr','sharedhost')) {
+            $path = Join-Path $rootKeyPath $subKey
+            if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
+            $currentVersion = (Get-ItemProperty -LiteralPath $path -Name Version -ErrorAction SilentlyContinue).Version
+            if ($currentVersion -ne $hostVersion) {
+                New-ItemProperty -LiteralPath $path -Name Version -Value $hostVersion -PropertyType String -Force | Out-Null
+                Add-Changed "Repaired .NET x64 $subKey registry version to $hostVersion."
+            } else {
+                Add-Verified ".NET x64 $subKey registry version already $hostVersion."
+            }
+        }
+    } else {
+        Add-Skipped '.NET host\fxr folder not found; skipped hostfxr/sharedhost registry values.'
+    }
+
+    $sharedRoot = Join-Path $dotnetRoot 'shared'
+    if (-not (Test-Path -LiteralPath $sharedRoot -PathType Container)) {
+        Add-Skipped '.NET shared runtime folder not found; skipped sharedfx registry values.'
+        return
+    }
+    foreach ($frameworkFolder in Get-ChildItem -LiteralPath $sharedRoot -Directory -ErrorAction SilentlyContinue) {
+        $frameworkKey = Join-Path (Join-Path $rootKeyPath 'sharedfx') $frameworkFolder.Name
+        if (-not (Test-Path -LiteralPath $frameworkKey)) { New-Item -Path $frameworkKey -Force | Out-Null }
+        foreach ($versionFolder in Get-ChildItem -LiteralPath $frameworkFolder.FullName -Directory -ErrorAction SilentlyContinue) {
+            $current = (Get-ItemProperty -LiteralPath $frameworkKey -Name $versionFolder.Name -ErrorAction SilentlyContinue).($versionFolder.Name)
+            if ($current -ne 1) {
+                New-ItemProperty -LiteralPath $frameworkKey -Name $versionFolder.Name -Value 1 -PropertyType DWord -Force | Out-Null
+                Add-Changed "Registered .NET x64 shared framework $($frameworkFolder.Name) $($versionFolder.Name)."
+            } else {
+                Add-Verified ".NET x64 shared framework $($frameworkFolder.Name) $($versionFolder.Name) already registered."
+            }
+        }
+    }
+}
+
+function Repair-DotNetRuntimeMismatch {
+    Write-Log 'Checking .NET SDK/runtime consistency for dotnet.exe hard-error popups.'
+    $dotnetRoot = Join-Path $env:ProgramFiles 'dotnet'
+    $sdkRoot = Join-Path $dotnetRoot 'sdk'
+    if (-not (Test-Path -LiteralPath $sdkRoot -PathType Container)) {
+        Add-Skipped '.NET SDK folder not found; skipped .NET runtime mismatch repair.'
+        return
+    }
+
+    $sdkVersions = @(Get-ChildItem -LiteralPath $sdkRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $candidateVersions = @()
+    foreach ($sdkVersion in $sdkVersions) {
+        $runtimeVersion = Get-DotNetRuntimeVersionForSdk -SdkVersion $sdkVersion
+        if ($runtimeVersion) { $candidateVersions += $runtimeVersion }
+    }
+    $candidateVersions = @($candidateVersions | Sort-Object -Unique)
+    if (-not $candidateVersions -or $candidateVersions.Count -eq 0) {
+        Add-Verified '.NET SDK/runtime layout has no preview SDK runtime mismatch candidates.'
+        return
+    }
+
+    foreach ($version in $candidateVersions) {
+        Install-DotNetRuntimeIfMissing -RuntimeName 'dotnet' -RuntimeFolder 'Microsoft.NETCore.App' -Version $version
+        Install-DotNetRuntimeIfMissing -RuntimeName 'windowsdesktop' -RuntimeFolder 'Microsoft.WindowsDesktop.App' -Version $version
+    }
+    foreach ($sdkVersion in $sdkVersions) {
+        if ($sdkVersion -match '-preview\.') {
+            Repair-DotNetSdkRuntimeTargets -SdkVersion $sdkVersion -SdkPath (Join-Path $sdkRoot $sdkVersion)
+        }
+    }
+    Repair-DotNetInstallRegistryMetadata
+}
+
 function Set-PlaybackRoute {
     Write-Log 'Repairing default playback route and system volume.'
     $nircmd = Join-Path $env:SystemRoot 'System32\nircmd.exe'
@@ -496,6 +806,7 @@ Repair-AudioDrivers
 Repair-NetworkInterfaces
 Repair-PnpDevices
 Repair-DnsAndConnectivity
+Repair-DotNetRuntimeMismatch
 Set-PlaybackRoute
 Verify-CurrentState
 if (-not $SelfTest) { Play-SoundTest }
