@@ -25,6 +25,9 @@ The executable relaunches elevated if needed, then runs `scripts\Repair-AudioBlu
 - `DeviceAssociationService` automatic and running.
 - `ShellHWDetection` automatic and running.
 - `DeviceInstall` enabled as demand start.
+- `Dnscache` automatic and running.
+- `Winmgmt` automatic and running.
+- `PlugPlay` enabled and running.
 - `Audiosrv` automatic and running.
 - `AudioEndpointBuilder` automatic and running.
 - `RtkAudioUniversalService` automatic and running.
@@ -32,9 +35,12 @@ The executable relaunches elevated if needed, then runs `scripts\Repair-AudioBlu
 - `NvVAD_WaveExtensible` enabled as demand start.
 - NVIDIA Display Container restored to automatic and running when installed.
 - `Wi-Fi` and `Ethernet` interfaces enabled if they were administratively disabled.
+- Disabled audio, Bluetooth, and network Plug and Play devices re-enabled when found.
+- DNS cache flushed and DNS registration refreshed only when DNS resolution is broken.
+- DHCP lease renewed only when internet connectivity is broken and no IPv4 address is detected.
 - Default playback route repaired through the proven monitor endpoints, ending on `M27UP`.
 - System audio unmuted and volume set to 87.5%.
-- Audio endpoint, Bluetooth, WiFi, Ethernet, and service state verified.
+- Audio endpoint, Bluetooth, WiFi, Ethernet, DNS, internet connectivity, and service state verified.
 - Already-good services and drivers are detected and logged as OK/SKIP instead of being restarted repeatedly.
 
 ## Logs

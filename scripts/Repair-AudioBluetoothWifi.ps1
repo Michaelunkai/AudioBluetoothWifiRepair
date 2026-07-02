@@ -146,6 +146,79 @@ function Enable-NetworkInterfaceIfDisabled {
     }
 }
 
+function Invoke-CommandIfNeeded {
+    param(
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    Write-Log "Running conditional repair: $Description"
+    $output = & $FilePath @Arguments 2>&1
+    foreach ($line in $output) {
+        if ($line) { Write-Log "$Description`: $line" }
+    }
+    if ($LASTEXITCODE -eq 0) {
+        Add-Changed $Description
+    } else {
+        Write-Log "$Description returned exit code $LASTEXITCODE." 'WARN'
+    }
+}
+
+function Test-InternetConnectivity {
+    $targets = @('1.1.1.1','8.8.8.8')
+    foreach ($target in $targets) {
+        if (Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-DnsResolution {
+    try {
+        [void][System.Net.Dns]::GetHostAddresses('www.microsoft.com')
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Enable-PnpDevicesIfDisabled {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string[]]$Classes,
+        [string]$NameExcludeRegex = ''
+    )
+    $getPnp = Get-Command Get-PnpDevice -ErrorAction SilentlyContinue
+    $enablePnp = Get-Command Enable-PnpDevice -ErrorAction SilentlyContinue
+    if (-not $getPnp -or -not $enablePnp) {
+        Add-Skipped "PnP cmdlets are unavailable; skipped disabled $Label device repair."
+        return
+    }
+
+    $devices = @()
+    foreach ($class in $Classes) {
+        $devices += @(Get-PnpDevice -Class $class -ErrorAction SilentlyContinue)
+    }
+    $devices = $devices | Where-Object {
+        $_ -and $_.Status -eq 'Disabled' -and
+        ($NameExcludeRegex -eq '' -or $_.FriendlyName -notmatch $NameExcludeRegex)
+    }
+    if (-not $devices -or $devices.Count -eq 0) {
+        Add-Verified "No disabled $Label devices found."
+        return
+    }
+    foreach ($device in $devices) {
+        try {
+            Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction Stop
+            Add-Changed "Enabled disabled $Label device: $($device.FriendlyName)"
+        } catch {
+            $script:HadError = $true
+            Write-Log "Failed to enable $Label device $($device.FriendlyName): $($_.Exception.Message)" 'ERROR'
+        }
+    }
+}
+
 function Repair-CoreServices {
     Write-Log 'Repairing Windows audio, diagnostics, network, WiFi, and Bluetooth services.'
     Set-ServiceStartModeSafe -Name 'EventLog' -Start auto
@@ -189,6 +262,15 @@ function Repair-CoreServices {
     Start-ServiceSafe -Name 'ShellHWDetection'
 
     Set-ServiceStartModeSafe -Name 'DeviceInstall' -Start demand
+
+    Set-ServiceStartModeSafe -Name 'Dnscache' -Start auto
+    Start-ServiceSafe -Name 'Dnscache'
+
+    Set-ServiceStartModeSafe -Name 'Winmgmt' -Start auto
+    Start-ServiceSafe -Name 'Winmgmt'
+
+    Set-ServiceStartModeSafe -Name 'PlugPlay' -Start demand
+    Start-ServiceSafe -Name 'PlugPlay'
 }
 
 function Repair-AudioDrivers {
@@ -206,6 +288,42 @@ function Repair-NetworkInterfaces {
     Write-Log 'Repairing network adapter administrative state when needed.'
     Enable-NetworkInterfaceIfDisabled -Name 'Wi-Fi'
     Enable-NetworkInterfaceIfDisabled -Name 'Ethernet'
+}
+
+function Repair-PnpDevices {
+    Write-Log 'Repairing disabled audio, Bluetooth, and network Plug and Play devices when needed.'
+    Enable-PnpDevicesIfDisabled -Label 'audio' -Classes @('AudioEndpoint','MEDIA') -NameExcludeRegex "Michael's S25 Ultra"
+    Enable-PnpDevicesIfDisabled -Label 'Bluetooth' -Classes @('Bluetooth')
+    Enable-PnpDevicesIfDisabled -Label 'network' -Classes @('Net')
+}
+
+function Repair-DnsAndConnectivity {
+    Write-Log 'Checking DNS and internet connectivity before network stack repair.'
+    $online = Test-InternetConnectivity
+    $dnsOk = Test-DnsResolution
+    if ($online -and $dnsOk) {
+        Add-Verified 'Internet connectivity and DNS resolution already work.'
+        return
+    }
+
+    if (-not $dnsOk) {
+        Invoke-CommandIfNeeded -Description 'Flushed DNS resolver cache because DNS resolution failed.' -FilePath "$env:SystemRoot\System32\ipconfig.exe" -Arguments @('/flushdns')
+        Invoke-CommandIfNeeded -Description 'Registered DNS records because DNS resolution failed.' -FilePath "$env:SystemRoot\System32\ipconfig.exe" -Arguments @('/registerdns')
+    } else {
+        Add-Verified 'DNS resolution already works.'
+    }
+
+    if (-not $online) {
+        $ipconfig = & "$env:SystemRoot\System32\ipconfig.exe" 2>&1
+        $hasIpv4 = (($ipconfig -join "`n") -match 'IPv4 Address')
+        if ($hasIpv4) {
+            Add-Skipped 'Internet ping failed, but IPv4 configuration exists; skipped disruptive IP stack reset.'
+        } else {
+            Invoke-CommandIfNeeded -Description 'Renewed DHCP lease because no IPv4 address was detected.' -FilePath "$env:SystemRoot\System32\ipconfig.exe" -Arguments @('/renew')
+        }
+    } else {
+        Add-Verified 'Internet connectivity already works.'
+    }
 }
 
 function Set-PlaybackRoute {
@@ -247,7 +365,7 @@ function Get-RenderEndpoints {
 
 function Verify-CurrentState {
     Write-Log 'Verifying repaired state.'
-    foreach ($name in 'EventLog','DPS','NlaSvc','Netman','WlanSvc','BthServ','Dhcp','DeviceAssociationService','ShellHWDetection','Audiosrv','AudioEndpointBuilder','RtkAudioUniversalService') {
+    foreach ($name in 'EventLog','DPS','NlaSvc','Netman','WlanSvc','BthServ','Dhcp','DeviceAssociationService','ShellHWDetection','Dnscache','Winmgmt','PlugPlay','Audiosrv','AudioEndpointBuilder','RtkAudioUniversalService') {
         $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -eq 'Running') {
             Add-Verified "$name is running."
@@ -315,6 +433,17 @@ function Verify-CurrentState {
     } else {
         Write-Log 'WiFi interface is not connected; services/drivers were still repaired.' 'WARN'
     }
+
+    if (Test-InternetConnectivity) {
+        Add-Verified 'Internet ping connectivity works.'
+    } else {
+        Write-Log 'Internet ping connectivity was not verified.' 'WARN'
+    }
+    if (Test-DnsResolution) {
+        Add-Verified 'DNS resolution works.'
+    } else {
+        Write-Log 'DNS resolution was not verified.' 'WARN'
+    }
 }
 
 function Play-SoundTest {
@@ -365,6 +494,8 @@ if (-not (Test-Admin)) {
 Repair-CoreServices
 Repair-AudioDrivers
 Repair-NetworkInterfaces
+Repair-PnpDevices
+Repair-DnsAndConnectivity
 Set-PlaybackRoute
 Verify-CurrentState
 if (-not $SelfTest) { Play-SoundTest }
